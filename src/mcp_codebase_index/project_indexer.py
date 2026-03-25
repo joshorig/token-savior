@@ -174,7 +174,7 @@ class ProjectIndexer:
             total_functions=total_functions,
             total_classes=total_classes,
             index_build_time_seconds=elapsed,
-            index_memory_bytes=sys.getsizeof(files),  # rough estimate
+            index_memory_bytes=sum(sys.getsizeof(m) + sys.getsizeof(m.lines) for m in files.values()),
         )
 
         logger.info(
@@ -752,6 +752,12 @@ class ProjectIndexer:
             if not imported_names:
                 continue
 
+            # Precompile one regex per imported name (reused across all bodies in this file)
+            compiled_patterns: dict[str, re.Pattern] = {
+                local_name: re.compile(r'\b' + re.escape(local_name) + r'\b')
+                for local_name in imported_names
+            }
+
             for func in metadata.functions:
                 func_qualified = self._qualify_name(
                     func.qualified_name, file_path, symbol_table
@@ -767,7 +773,7 @@ class ProjectIndexer:
                     # fast path: skip regex if the name isn't even in the text
                     if local_name not in body_text:
                         continue
-                    if re.search(r'\b' + re.escape(local_name) + r'\b', body_text):
+                    if compiled_patterns[local_name].search(body_text):
                         if resolved_name != func_qualified:
                             global_graph[func_qualified].add(resolved_name)
 
@@ -784,7 +790,7 @@ class ProjectIndexer:
                     # fast path: skip regex if the name isn't even in the text
                     if local_name not in body_text:
                         continue
-                    if re.search(r'\b' + re.escape(local_name) + r'\b', body_text):
+                    if compiled_patterns[local_name].search(body_text):
                         if resolved_name != cls_qualified:
                             global_graph[cls_qualified].add(resolved_name)
 

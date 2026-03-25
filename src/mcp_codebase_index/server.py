@@ -33,7 +33,6 @@ import hashlib
 import json
 import os
 import sys
-import pickle
 import time
 import traceback
 
@@ -59,8 +58,8 @@ _query_fns: dict | None = None
 _is_git: bool = False
 
 # Persistent cache
-_CACHE_FILENAME = ".codebase-index-cache.pkl"
-_CACHE_VERSION = 1  # Bump when ProjectIndex schema changes
+_CACHE_FILENAME = ".codebase-index-cache.json"
+_CACHE_VERSION = 2  # Bumped: switched from pickle to JSON
 
 # Session usage stats
 _session_start: float = time.time()
@@ -237,35 +236,115 @@ def _cache_path(project_root: str) -> str:
     return os.path.join(project_root, _CACHE_FILENAME)
 
 
+def _index_to_dict(index: "ProjectIndex") -> dict:
+    """Serialize a ProjectIndex to a JSON-compatible dict (sets become sorted lists)."""
+    from dataclasses import asdict
+
+    def _convert(obj):
+        if isinstance(obj, set):
+            return sorted(obj)
+        if isinstance(obj, dict):
+            return {k: _convert(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_convert(i) for i in obj]
+        return obj
+
+    return _convert(asdict(index))
+
+
+def _index_from_dict(data: dict) -> "ProjectIndex":
+    """Deserialize a ProjectIndex from JSON dict, restoring sets where needed."""
+    from mcp_codebase_index.models import (
+        ProjectIndex, StructuralMetadata, FunctionInfo, ClassInfo,
+        ImportInfo, SectionInfo, LineRange
+    )
+
+    def _lr(d: dict) -> LineRange:
+        return LineRange(start=d["start"], end=d["end"])
+
+    def _fi(d: dict) -> FunctionInfo:
+        return FunctionInfo(
+            name=d["name"], qualified_name=d["qualified_name"],
+            line_range=_lr(d["line_range"]), parameters=d["parameters"],
+            decorators=d["decorators"], docstring=d.get("docstring"),
+            is_method=d["is_method"], parent_class=d.get("parent_class"),
+        )
+
+    def _ci(d: dict) -> ClassInfo:
+        return ClassInfo(
+            name=d["name"], line_range=_lr(d["line_range"]),
+            base_classes=d["base_classes"], methods=[_fi(m) for m in d["methods"]],
+            decorators=d["decorators"], docstring=d.get("docstring"),
+        )
+
+    def _ii(d: dict) -> ImportInfo:
+        return ImportInfo(
+            module=d["module"], names=d["names"], alias=d.get("alias"),
+            line_number=d["line_number"], is_from_import=d["is_from_import"],
+        )
+
+    def _si(d: dict) -> SectionInfo:
+        return SectionInfo(title=d["title"], level=d["level"], line_range=_lr(d["line_range"]))
+
+    def _sm(d: dict) -> StructuralMetadata:
+        return StructuralMetadata(
+            source_name=d["source_name"], total_lines=d["total_lines"],
+            total_chars=d["total_chars"], lines=d["lines"],
+            line_char_offsets=d["line_char_offsets"],
+            functions=[_fi(f) for f in d.get("functions", [])],
+            classes=[_ci(c) for c in d.get("classes", [])],
+            imports=[_ii(i) for i in d.get("imports", [])],
+            sections=[_si(s) for s in d.get("sections", [])],
+            dependency_graph=d.get("dependency_graph", {}),
+        )
+
+    # Restore sets in graph fields
+    def _sets(d: dict) -> dict[str, set[str]]:
+        return {k: set(v) for k, v in d.items()}
+
+    return ProjectIndex(
+        root_path=data["root_path"],
+        files={k: _sm(v) for k, v in data["files"].items()},
+        global_dependency_graph=_sets(data.get("global_dependency_graph", {})),
+        reverse_dependency_graph=_sets(data.get("reverse_dependency_graph", {})),
+        import_graph=_sets(data.get("import_graph", {})),
+        reverse_import_graph=_sets(data.get("reverse_import_graph", {})),
+        symbol_table=data.get("symbol_table", {}),
+        total_files=data.get("total_files", 0),
+        total_lines=data.get("total_lines", 0),
+        total_functions=data.get("total_functions", 0),
+        total_classes=data.get("total_classes", 0),
+        index_build_time_seconds=data.get("index_build_time_seconds", 0.0),
+        index_memory_bytes=data.get("index_memory_bytes", 0),
+        last_indexed_git_ref=data.get("last_indexed_git_ref"),
+    )
+
+
 def _save_cache(index: "ProjectIndex") -> None:
-    """Persist the project index to a pickle cache file."""
+    """Persist the project index to a JSON cache file."""
     try:
         root = index.root_path
         path = _cache_path(root)
-        payload = {"version": _CACHE_VERSION, "index": index}
-        with open(path, "wb") as f:
-            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+        payload = {"version": _CACHE_VERSION, "index": _index_to_dict(index)}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"))
         print(f"[mcp-codebase-index] Cache saved → {path}", file=sys.stderr)
     except Exception as exc:
         print(f"[mcp-codebase-index] Cache save failed: {exc}", file=sys.stderr)
 
 
 def _load_cache(project_root: str) -> "ProjectIndex | None":
-    """Load a cached project index if it exists and is compatible."""
+    """Load a cached project index from JSON if it exists and is compatible."""
     path = _cache_path(project_root)
     if not os.path.exists(path):
         return None
     try:
-        with open(path, "rb") as f:
-            payload = pickle.load(f)
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
         if not isinstance(payload, dict) or payload.get("version") != _CACHE_VERSION:
             print("[mcp-codebase-index] Cache version mismatch, ignoring", file=sys.stderr)
             return None
-        index = payload["index"]
-        from mcp_codebase_index.models import ProjectIndex as PI
-        if not isinstance(index, PI):
-            return None
-        return index
+        return _index_from_dict(payload["index"])
     except Exception as exc:
         print(f"[mcp-codebase-index] Cache load failed: {exc}", file=sys.stderr)
         return None
